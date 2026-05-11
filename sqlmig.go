@@ -4,7 +4,9 @@ package sqlmig
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"slices"
 )
@@ -29,9 +31,10 @@ func (s Source) Migrate(ctx context.Context, db DB) error {
 	}
 	slices.Sort(files)
 	const migrationSchemaSQL = `
-	create table if not exists db_migrations (
-		name text primary key
-	)`
+create table if not exists db_migrations (
+  name text primary key,
+  hash integer not null
+)`
 	if _, err := db.ExecContext(ctx, migrationSchemaSQL); err != nil {
 		return fmt.Errorf("sqlmig: error creating db_migrations table: %w", err)
 	}
@@ -46,16 +49,20 @@ func (s Source) Migrate(ctx context.Context, db DB) error {
 		}
 		defer tx.Rollback()
 
-		const alreadyDoneSQL = `select count(*) from db_migrations where name = ?`
-		var alreadyDone int
-		if err := tx.QueryRowContext(ctx, alreadyDoneSQL, filename).Scan(&alreadyDone); err != nil {
+		hash := fnv1a(data)
+		const existingHashSQL = `select hash from db_migrations where name = ?`
+		var existingHash int64
+		err = tx.QueryRowContext(ctx, existingHashSQL, filename).Scan(&existingHash)
+		if err == nil {
+			if existingHash != hash {
+				return fmt.Errorf("sqlmig: migration was modified: %q", filename)
+			}
+			tx.Rollback()
+			continue // hash is good, continue to next migration
+		} else if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("sqlmig: error checking migration status: %q: %w", filename, err)
 		}
-		if alreadyDone == 1 {
-			tx.Rollback()
-			continue
-		}
-		if _, err := tx.ExecContext(ctx, `insert into db_migrations values (?)`, filename); err != nil {
+		if _, err := tx.ExecContext(ctx, `insert into db_migrations values (?, ?)`, filename, hash); err != nil {
 			return fmt.Errorf("sqlmig: error updating migration status: %q: %w", filename, err)
 		}
 		if _, err := tx.ExecContext(ctx, string(data)); err != nil {
@@ -66,4 +73,10 @@ func (s Source) Migrate(ctx context.Context, db DB) error {
 		}
 	}
 	return nil
+}
+
+func fnv1a(data []byte) int64 {
+	h := fnv.New64a()
+	h.Write(data)
+	return int64(h.Sum64())
 }
